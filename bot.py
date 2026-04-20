@@ -1,10 +1,18 @@
 import os
 import json
-from telegram import Update, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup
+from telegram import (
+    Update,
+    WebAppInfo,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -13,9 +21,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MINI_APP_URL = os.getenv("MINI_APP_URL")
 MANAGER_ID = os.getenv("MANAGER_ID")
 
-# Заявки в памяти процесса
 REQUESTS = {}
 REQUEST_COUNTER = 1
+PENDING_REPLIES = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -72,9 +80,7 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Всего CC: {data.get('total_cc', '0')}\n"
             f"Эквивалент: ${data.get('usd_value', '0.00')}\n\n"
             f"Клиент: {username_text}\n"
-            f"Telegram ID: {chat.id}\n\n"
-            f"Ответить клиенту:\n"
-            f"/reply {req_id} ваш текст"
+            f"Telegram ID: {chat.id}"
         )
     else:
         manager_text = (
@@ -84,65 +90,111 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Всего CC: {data.get('total_cc', '0')}\n"
             f"Эквивалент: ${data.get('usd_value', '0.00')}\n\n"
             f"Клиент: {username_text}\n"
-            f"Telegram ID: {chat.id}\n\n"
-            f"Ответить клиенту:\n"
-            f"/reply {req_id} ваш текст"
+            f"Telegram ID: {chat.id}"
         )
 
-    # Сообщение клиенту
+    reply_markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "💬 Ответить клиенту",
+                    callback_data=f"reply:{req_id}"
+                )
+            ]
+        ]
+    )
+
     await update.message.reply_text(
         f"✅ Заявка #{req_id} отправлена.\n"
         f"Ожидайте ответ менеджера в этом чате."
     )
 
-    # Сообщение менеджеру
     if MANAGER_ID:
-        await context.bot.send_message(chat_id=int(MANAGER_ID), text=manager_text)
+        await context.bot.send_message(
+            chat_id=int(MANAGER_ID),
+            text=manager_text,
+            reply_markup=reply_markup
+        )
     else:
-        # запасной вариант — в этот же чат
-        await update.message.reply_text(manager_text)
+        await update.message.reply_text(
+            manager_text,
+            reply_markup=reply_markup
+        )
 
 
-async def reply_to_client(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not MANAGER_ID:
-        await update.message.reply_text("MANAGER_ID не задан.")
+async def reply_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if MANAGER_ID and str(query.message.chat_id) != str(MANAGER_ID):
+        await query.message.reply_text("Эта кнопка доступна только менеджеру.")
         return
 
-    if str(update.effective_chat.id) != str(MANAGER_ID):
-        await update.message.reply_text("Команда доступна только менеджеру.")
+    data = query.data
+    if not data.startswith("reply:"):
         return
 
-    if len(context.args) < 2:
-        await update.message.reply_text("Использование: /reply ID_заявки текст")
+    req_id = int(data.split(":")[1])
+
+    if req_id not in REQUESTS:
+        await query.message.reply_text("Заявка не найдена.")
         return
 
-    try:
-        req_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("ID заявки должен быть числом.")
+    manager_chat_id = query.message.chat_id
+    PENDING_REPLIES[manager_chat_id] = req_id
+
+    await query.message.reply_text(
+        f"✍️ Напиши сообщение для заявки #{req_id}.\n"
+        f"Оно будет отправлено клиенту следующим сообщением."
+    )
+
+
+async def handle_manager_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
         return
+
+    manager_chat_id = update.effective_chat.id
+
+    if MANAGER_ID and str(manager_chat_id) != str(MANAGER_ID):
+        return
+
+    if manager_chat_id not in PENDING_REPLIES:
+        return
+
+    req_id = PENDING_REPLIES[manager_chat_id]
 
     if req_id not in REQUESTS:
         await update.message.reply_text("Заявка не найдена.")
+        del PENDING_REPLIES[manager_chat_id]
         return
 
-    text = " ".join(context.args[1:])
     client_chat_id = REQUESTS[req_id]["chat_id"]
+    text = update.message.text or ""
 
     await context.bot.send_message(
         chat_id=client_chat_id,
         text=f"💬 Ответ менеджера по заявке #{req_id}:\n\n{text}"
     )
 
-    await update.message.reply_text(f"Ответ по заявке #{req_id} отправлен клиенту.")
+    await update.message.reply_text(
+        f"✅ Ответ по заявке #{req_id} отправлен клиенту."
+    )
+
+    del PENDING_REPLIES[manager_chat_id]
 
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("reply", reply_to_client))
     app.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data))
+    app.add_handler(CallbackQueryHandler(reply_button))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_manager_message
+        )
+    )
 
     print("Bot started...")
     app.run_polling()
@@ -150,3 +202,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
