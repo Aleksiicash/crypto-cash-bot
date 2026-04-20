@@ -1,0 +1,9 @@
+БЫСТРЫЙ ЗАПУСК
+
+1. Опубликуйте mini app
+2. Укажите его URL в MINI_APP_URL
+3. Возьмите BOT_TOKEN из BotFather
+4. Запустите bot.py на Render / Railway / VPS
+5. В BotFather настройте:
+   /setdomain -> домен mini app без https
+   /setmenubutton -> URL mini app с https
