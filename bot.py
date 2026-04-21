@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 from telegram import (
     Update,
     WebAppInfo,
@@ -17,6 +18,11 @@ from telegram.ext import (
     filters,
 )
 
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO
+)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MINI_APP_URL = os.getenv("MINI_APP_URL")
 MANAGER_ID = os.getenv("MANAGER_ID")
@@ -24,6 +30,13 @@ MANAGER_ID = os.getenv("MANAGER_ID")
 REQUESTS = {}
 REQUEST_COUNTER = 1
 PENDING_REPLIES = {}
+
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -48,12 +61,23 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user = update.effective_user
     chat = update.effective_chat
+    raw_data = update.message.web_app_data.data
+
+    logging.info("WEB_APP_DATA RAW: %s", raw_data)
 
     try:
-        data = json.loads(update.message.web_app_data.data)
+        data = json.loads(raw_data)
     except Exception:
+        logging.exception("Ошибка чтения JSON из web_app_data")
         await update.message.reply_text("Ошибка чтения заявки.")
         return
+
+    request_type = (
+        data.get("type")
+        or data.get("action")
+        or data.get("request_type")
+        or ""
+    )
 
     req_id = REQUEST_COUNTER
     REQUEST_COUNTER += 1
@@ -68,27 +92,63 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     username_text = f"@{user.username}" if user and user.username else "нет username"
 
-    if data.get("type") == "exchange_request":
+    client_name = (
+        data.get("name")
+        or data.get("client_name")
+        or data.get("first_name")
+        or (user.first_name if user else None)
+        or "—"
+    )
+
+    direction = (
+        data.get("direction")
+        or data.get("exchange_direction")
+        or "—"
+    )
+
+    amount = (
+        data.get("amount")
+        or data.get("sum")
+        or data.get("amount_text")
+        or "—"
+    )
+
+    comment = (
+        data.get("comment")
+        or data.get("notes")
+        or data.get("comment_text")
+        or "—"
+    )
+
+    daily_cc = data.get("daily_cc", 0)
+    bank_cc = data.get("bank_cc", 0)
+    total_cc = data.get("total_cc", 0)
+    usd_value = data.get("usd_value", "0.00")
+
+    logging.info("PARSED REQUEST TYPE: %s", request_type)
+    logging.info("PARSED DATA: %s", data)
+
+    if request_type == "exchange_request":
         manager_text = (
             f"📩 Новая заявка #{req_id}\n\n"
-            f"Имя: {data.get('name', '—')}\n"
-            f"Направление: {data.get('direction', '—')}\n"
-            f"Сумма: {data.get('amount', '—')}\n"
-            f"Комментарий: {data.get('comment', '—')}\n"
-            f"Сегодня CC: {data.get('daily_cc', '0')}\n"
-            f"Копилка CC: {data.get('bank_cc', '0')}\n"
-            f"Всего CC: {data.get('total_cc', '0')}\n"
-            f"Эквивалент: ${data.get('usd_value', '0.00')}\n\n"
+            f"Имя: {client_name}\n"
+            f"Направление: {direction}\n"
+            f"Сумма: {amount}\n"
+            f"Комментарий: {comment}\n"
+            f"Сегодня CC: {daily_cc}\n"
+            f"Копилка CC: {bank_cc}\n"
+            f"Всего CC: {total_cc}\n"
+            f"Эквивалент: ${usd_value}\n\n"
             f"Клиент: {username_text}\n"
             f"Telegram ID: {chat.id}"
         )
     else:
         manager_text = (
             f"💰 Запрос на обмен CC #{req_id}\n\n"
-            f"Сегодня CC: {data.get('daily_cc', '0')}\n"
-            f"Копилка CC: {data.get('bank_cc', '0')}\n"
-            f"Всего CC: {data.get('total_cc', '0')}\n"
-            f"Эквивалент: ${data.get('usd_value', '0.00')}\n\n"
+            f"Сегодня CC: {daily_cc}\n"
+            f"Копилка CC: {bank_cc}\n"
+            f"Всего CC: {total_cc}\n"
+            f"Эквивалент: ${usd_value}\n\n"
             f"Клиент: {username_text}\n"
             f"Telegram ID: {chat.id}"
         )
@@ -104,22 +164,27 @@ async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE
         ]
     )
 
+    try:
+        if MANAGER_ID:
+            await context.bot.send_message(
+                chat_id=int(MANAGER_ID),
+                text=manager_text,
+                reply_markup=reply_markup
+            )
+        else:
+            await update.message.reply_text(
+                manager_text,
+                reply_markup=reply_markup
+            )
+    except Exception:
+        logging.exception("Не удалось отправить заявку менеджеру")
+        await update.message.reply_text("Ошибка отправки заявки менеджеру.")
+        return
+
     await update.message.reply_text(
         f"✅ Заявка #{req_id} отправлена.\n"
         f"Ожидайте ответ менеджера в этом чате."
     )
-
-    if MANAGER_ID:
-        await context.bot.send_message(
-            chat_id=int(MANAGER_ID),
-            text=manager_text,
-            reply_markup=reply_markup
-        )
-    else:
-        await update.message.reply_text(
-            manager_text,
-            reply_markup=reply_markup
-        )
 
 
 async def reply_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -184,6 +249,11 @@ async def handle_manager_message(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def main():
+    if not BOT_TOKEN:
+        raise ValueError("Не задан BOT_TOKEN")
+    if not MINI_APP_URL:
+        raise ValueError("Не задан MINI_APP_URL")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -196,11 +266,9 @@ def main():
         )
     )
 
-    print("Bot started...")
+    logging.info("Bot started...")
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
-
